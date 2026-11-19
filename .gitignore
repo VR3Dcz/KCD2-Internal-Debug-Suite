@@ -30,3 +30,11 @@
 *.exe
 *.out
 *.app
+
+# Build directories and output artifacts
+build/
+obj/
+bin/
+UniversalHookX/build/
+UniversalHookX/obj/
+UniversalHookX/bin/

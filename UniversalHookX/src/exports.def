@@ -1,0 +1,2 @@
+EXPORTS
+    FMODGetDSPDescription=Quatmosphere_orig.dll.FMODGetDSPDescription @1
