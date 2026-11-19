@@ -76,14 +76,14 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutDir>.\bin\</OutDir>
     <IntDir>.\obj\$(Configuration) $(Platform)\</IntDir>
-    <TargetName>$(ProjectName) $(Configuration) $(Platform)</TargetName>
+    <TargetName>Quatmosphere</TargetName>
     <IncludePath>$(VULKAN_SDK)\Include;$(IncludePath)</IncludePath>
     <LibraryPath>C:\Program Files %28x86%29\Intel\oneAPI\compiler\2023.0.0\windows\compiler\lib\intel64_win;$(VULKAN_SDK)\Lib;$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>.\bin\</OutDir>
     <IntDir>.\obj\$(Configuration) $(Platform)\</IntDir>
-    <TargetName>$(ProjectName) $(Configuration) $(Platform)</TargetName>
+    <TargetName>Quatmosphere</TargetName>
     <IncludePath>$(VULKAN_SDK)\Include;$(IncludePath)</IncludePath>
     <LibraryPath>C:\Program Files %28x86%29\Intel\oneAPI\compiler\2023.0.0\windows\compiler\lib\intel64_win;$(VULKAN_SDK)\Lib;$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64)</LibraryPath>
   </PropertyGroup>
@@ -227,6 +227,7 @@
     <ClCompile Include="src\hooks\backend\vulkan\hook_vulkan.cpp" />
     <ClCompile Include="src\hooks\hooks.cpp" />
     <ClCompile Include="src\hooks\ig-hooks.cpp" />
+    <ClCompile Include="src\menu\lua_scripts.cpp" />
     <ClCompile Include="src\menu\menu.cpp" />
     <ClCompile Include="src\utils\utils.cpp" />
   </ItemGroup>
@@ -271,6 +272,7 @@
     <ClInclude Include="src\hooks\hooks.hpp" />
     <ClInclude Include="src\hooks\ig-hooks.h" />
     <ClInclude Include="src\menu\item_map.h" />
+    <ClInclude Include="src\menu\lua_scripts.hpp" />
     <ClInclude Include="src\menu\menu.hpp" />
     <ClInclude Include="src\MyMem.h" />
     <ClInclude Include="src\utils\utils.hpp" />

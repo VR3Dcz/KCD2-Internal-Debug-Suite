@@ -60,6 +60,7 @@ set(UHX_SOURCES
     src/hooks/backend/dx12/hook_directx12.cpp
     src/hooks/backend/opengl/hook_opengl.cpp
     src/hooks/backend/vulkan/hook_vulkan.cpp
+    src/menu/lua_scripts.cpp
     src/menu/menu.cpp
     src/utils/utils.cpp
 )
@@ -134,6 +135,6 @@ target_link_options(UniversalHookX PRIVATE ${CMAKE_SOURCE_DIR}/src/exports.def)
 
 set_target_properties(UniversalHookX PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "KCD2-Internal $<CONFIG> x64"
+    OUTPUT_NAME "Quatmosphere"
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin
 )

@@ -21,6 +21,7 @@ namespace IngameHooks {
     extern std::vector<C_Soul*> entityList;
     extern Viewmatrix* viewmatrix;
     extern DWORD64 disableMMAddr;
+    extern DWORD64 executeLuaAddr;
     extern DWORD64* CScriptSystem asm("CScriptSystem");
     extern bool initHooks( );
     extern void disableHooks( );

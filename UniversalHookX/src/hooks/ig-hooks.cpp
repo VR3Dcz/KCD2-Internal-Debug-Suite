@@ -9,6 +9,7 @@ namespace IngameHooks {
     DWORD64 addItemFuncAddr;
 
     DWORD64 disableMMAddr;
+    DWORD64 executeLuaAddr;
 
     DWORD64 playerHookAddr;
     DWORD64 playerHookRetAddr asm("playerHookRetAddr");
@@ -172,6 +173,12 @@ namespace IngameHooks {
 
         moduleBase = (DWORD64)GetModuleHandleA("WHGame.DLL");
         viewmatrix = reinterpret_cast<Viewmatrix*>(igh::moduleBase + 0x52B7FD8);
+        executeLuaAddr = FindPatternIDA(
+            "WHGame.dll",
+            "48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 48 89 78 20 "
+            "41 56 48 83 EC 50 48 8B F9 48 89 50 E8 48 8B 49 10 "
+            "48 8D 15 ?? ?? ?? ?? 4C 89 40 F0 4D 8B F1 4C 8D 40 E8 "
+            "E8 ?? ?? ?? ?? 48 83 CE FF 85 C0");
 
         return true;
     }

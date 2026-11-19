@@ -93,7 +93,7 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$outputDll = Join-Path $SourceDir "bin\KCD2-Internal $Config x64.dll"
+$outputDll = Join-Path $SourceDir "bin\Quatmosphere.dll"
 if (Test-Path $outputDll) {
     Write-Host "Build succeeded: $outputDll"
 } else {
