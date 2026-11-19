@@ -3,4 +3,4 @@
 // filesystem. This shim makes that spelling resolve when cross-compiling
 // from a case-sensitive filesystem (e.g. Linux).
 #pragma once
-#include <windows.h>
+#include_next <windows.h>

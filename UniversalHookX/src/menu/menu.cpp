@@ -6,6 +6,7 @@
 #include "../hooks/ig-hooks.h"
 #include "../utils/seh_shim.hpp"
 #include "item_map.h"
+#include "lua_scripts.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -13,8 +14,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <stdio.h>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ig = ImGui;
@@ -55,43 +59,23 @@ namespace Menu {
 
     // ── Save/Load Settings ────────────────────────────────────────────────────
     static void SaveSettings( ) {
-        char path[MAX_PATH];
-        if (GetModuleFileNameA(NULL, path, MAX_PATH)) {
-            std::string s(path);
-            size_t binPos = s.find("\\Bin\\");
-            if (binPos == std::string::npos)
-                binPos = s.find("/Bin/");
-
-            if (binPos != std::string::npos) {
-                std::string setPath = s.substr(0, binPos) + "\\menu_settings.bin";
-                FILE* f = fopen(setPath.c_str( ), "wb");
-                if (f) {
-                    fwrite(&s_settings, sizeof(MenuSettings), 1, f);
-                    fclose(f);
-                    s_settingsSaveStatus = "Settings saved successfully!";
-                    return;
-                }
+        const std::filesystem::path setPath = LuaScripts::ResolveStorageBaseDir( ) / L"menu_settings.bin";
+        std::ofstream f(setPath, std::ios::binary | std::ios::trunc);
+        if (f.is_open( )) {
+            f.write(reinterpret_cast<const char*>(&s_settings), sizeof(MenuSettings));
+            if (f.good( )) {
+                s_settingsSaveStatus = "Settings saved successfully!";
+                return;
             }
         }
         s_settingsSaveStatus = "Error: Could not save settings.";
     }
 
     static void LoadSettings( ) {
-        char path[MAX_PATH];
-        if (GetModuleFileNameA(NULL, path, MAX_PATH)) {
-            std::string s(path);
-            size_t binPos = s.find("\\Bin\\");
-            if (binPos == std::string::npos)
-                binPos = s.find("/Bin/");
-
-            if (binPos != std::string::npos) {
-                std::string setPath = s.substr(0, binPos) + "\\menu_settings.bin";
-                FILE* f = fopen(setPath.c_str( ), "rb");
-                if (f) {
-                    fread(&s_settings, sizeof(MenuSettings), 1, f);
-                    fclose(f);
-                }
-            }
+        const std::filesystem::path setPath = LuaScripts::ResolveStorageBaseDir( ) / L"menu_settings.bin";
+        std::ifstream f(setPath, std::ios::binary);
+        if (f.is_open( )) {
+            f.read(reinterpret_cast<char*>(&s_settings), sizeof(MenuSettings));
         }
     }
 
@@ -1080,22 +1064,44 @@ namespace Menu {
         // ══════════════════════════════════════════════════════════════════════
         //  Lua Executor panel
         // ══════════════════════════════════════════════════════════════════════
-        static char s_luaBuffer[8192] = "System.LogAlways('Hello from the Menu Executor!')\n";
+        static char s_luaBuffer[LuaScripts::ScriptStore::kMaxScriptBytes + 1] =
+            "System.LogAlways('Hello from the Menu Executor!')\n";
+        static std::string s_luaBaseline = s_luaBuffer;
         static std::string s_luaLastAction = "";
+
+        static LuaScripts::ScriptStore s_luaScripts;
+        static bool s_luaScriptsInitialized = false;
+
+        enum class PendingLuaSwitchAction {
+            None,
+            NewScript,
+            LoadSavedScript,
+            LoadExample
+        };
+
+        static bool s_openSaveAsModal = false;
+        static bool s_openRenameModal = false;
+        static bool s_openDeleteModal = false;
+        static bool s_openUnsavedModal = false;
+        static bool s_focusModalInput = false;
+        static bool s_saveAsNeedsOverwriteConfirm = false;
+        static char s_modalNameInput[128] = "";
+        static std::string s_modalError = "";
+        static PendingLuaSwitchAction s_pendingSwitchAction = PendingLuaSwitchAction::None;
+        static size_t s_pendingSavedIndex = 0;
+        static const char* s_pendingExampleCode = nullptr;
+        static bool s_pendingContinueSwitchAfterSave = false;
 
         static int s_lastSelStart = 0;
         static int s_lastSelEnd = 0;
         static int s_lastBufTextLen = 0;
 
-        static bool SafeCallExecuteLua(const char* code, int64_t* outResult) {
+        static bool SafeCallExecuteLua(const char* code, bool* outLuaOk) {
             SEH_TRY {
-                HMODULE hModule = GetModuleHandleA("WHGame.dll");
-                uintptr_t executeLuaAddr = hModule ? (reinterpret_cast<uintptr_t>(hModule) + 0x4D46E4) : 0x1804d46e4;
+                typedef bool(__fastcall * ExecuteLuaBufferFunc)(void*, const char*, size_t, const char*, void*);
+                ExecuteLuaBufferFunc executeLua = reinterpret_cast<ExecuteLuaBufferFunc>(hk::executeLuaAddr);
 
-                typedef int64_t(__fastcall * ExecuteLuaBufferFunc)(void*, const char*, size_t, const char*, void*);
-                ExecuteLuaBufferFunc executeLua = reinterpret_cast<ExecuteLuaBufferFunc>(executeLuaAddr);
-
-                *outResult = executeLua(
+                *outLuaOk = executeLua(
                     reinterpret_cast<void*>(hk::CScriptSystem),
                     code,
                     strlen(code),
@@ -1112,10 +1118,14 @@ namespace Menu {
                 s_luaLastAction = "Error: hk::CScriptSystem is null! Load into a game first.";
                 return;
             }
+            if (!hk::executeLuaAddr) {
+                s_luaLastAction = "Error: ExecuteBuffer signature not found in WHGame.dll.";
+                return;
+            }
 
-            int64_t result = 0;
-            if (SafeCallExecuteLua(code, &result)) {
-                s_luaLastAction = "Executed successfully.";
+            bool luaOk = false;
+            if (SafeCallExecuteLua(code, &luaOk)) {
+                s_luaLastAction = luaOk ? "Executed successfully." : "Error: Lua execution failed (see kcd.log).";
             } else {
                 s_luaLastAction = "Exception caught! Crash prevented.";
             }
@@ -2045,15 +2055,273 @@ namespace Menu {
              "best.soul:DealDamage(15, 0, player.id, false)\n"},
         };
 
-        static void LoadLuaExample(const char* code) {
-            if (!code)
-                return;
-            size_t len = strlen(code);
+        static void SetLuaEditorText(const std::string& code, bool updateBaseline) {
+            size_t len = code.size( );
             if (len >= sizeof(s_luaBuffer))
                 len = sizeof(s_luaBuffer) - 1;
-            memcpy(s_luaBuffer, code, len);
+            if (len > 0)
+                memcpy(s_luaBuffer, code.data( ), len);
             s_luaBuffer[len] = '\0';
+
             s_cursorBytePos = 0;
+            s_lastSelStart = 0;
+            s_lastSelEnd = 0;
+            s_lastBufTextLen = static_cast<int>(len);
+            s_pendingCursorPos = 0;
+
+            if (updateBaseline)
+                s_luaBaseline.assign(s_luaBuffer, len);
+        }
+
+        static bool IsLuaEditorDirty( ) {
+            return std::string_view(s_luaBuffer) != s_luaBaseline;
+        }
+
+        static void OpenSaveAsModal(bool continueSwitchAfterSave = false) {
+            s_modalError.clear( );
+            s_saveAsNeedsOverwriteConfirm = false;
+            s_pendingContinueSwitchAfterSave = continueSwitchAfterSave;
+            if (const auto* active = s_luaScripts.ActiveScript( )) {
+                snprintf(s_modalNameInput, sizeof(s_modalNameInput), "%s", active->displayName.c_str( ));
+            } else {
+                s_modalNameInput[0] = '\0';
+            }
+            s_openSaveAsModal = true;
+            s_focusModalInput = true;
+        }
+
+        static void OpenRenameModal( ) {
+            const auto* active = s_luaScripts.ActiveScript( );
+            if (!active)
+                return;
+            s_modalError.clear( );
+            snprintf(s_modalNameInput, sizeof(s_modalNameInput), "%s", active->displayName.c_str( ));
+            s_openRenameModal = true;
+            s_focusModalInput = true;
+        }
+
+        static void ApplyPendingLuaSwitchAction( ) {
+            const PendingLuaSwitchAction action = s_pendingSwitchAction;
+            s_pendingSwitchAction = PendingLuaSwitchAction::None;
+
+            if (action == PendingLuaSwitchAction::NewScript) {
+                s_luaScripts.ClearSelection( );
+                SetLuaEditorText("", true);
+                s_luaLastAction = "Started new unsaved script.";
+            } else if (action == PendingLuaSwitchAction::LoadSavedScript) {
+                std::string content;
+                std::string err;
+                if (s_luaScripts.LoadScript(s_pendingSavedIndex, content, err)) {
+                    SetLuaEditorText(content, true);
+                    if (const auto* active = s_luaScripts.ActiveScript( )) {
+                        s_luaLastAction = "Loaded " + active->fileName;
+                    }
+                } else {
+                    s_luaLastAction = err;
+                }
+            } else if (action == PendingLuaSwitchAction::LoadExample) {
+                if (s_pendingExampleCode) {
+                    s_luaScripts.ClearSelection( );
+                    SetLuaEditorText(s_pendingExampleCode, true);
+                    s_luaLastAction.clear( );
+                }
+            }
+            s_pendingExampleCode = nullptr;
+        }
+
+        static void RequestLuaSwitch(PendingLuaSwitchAction action, size_t savedIndex = 0, const char* exampleCode = nullptr) {
+            if (action == PendingLuaSwitchAction::LoadSavedScript &&
+                s_luaScripts.ActiveIndex( ).has_value( ) &&
+                *s_luaScripts.ActiveIndex( ) == savedIndex &&
+                !IsLuaEditorDirty( )) {
+                return;
+            }
+
+            s_pendingSwitchAction = action;
+            s_pendingSavedIndex = savedIndex;
+            s_pendingExampleCode = exampleCode;
+
+            if (IsLuaEditorDirty( )) {
+                s_openUnsavedModal = true;
+            } else {
+                ApplyPendingLuaSwitchAction( );
+            }
+        }
+
+        static bool SaveCurrentScriptOrPromptAs(bool continueSwitchAfterSave = false) {
+            if (s_luaScripts.ActiveScript( )) {
+                std::string err;
+                const std::string content(s_luaBuffer);
+                if (s_luaScripts.SaveActive(content, err)) {
+                    s_luaBaseline = content;
+                    if (const auto* active = s_luaScripts.ActiveScript( )) {
+                        s_luaLastAction = "Saved " + active->fileName;
+                    }
+                    return true;
+                }
+                s_luaLastAction = err;
+                return false;
+            }
+            OpenSaveAsModal(continueSwitchAfterSave);
+            return false;
+        }
+
+        static void RenderLuaModals( ) {
+            if (s_openSaveAsModal) {
+                ig::OpenPopup("Save Lua Script As##lua_save_as_modal");
+                s_openSaveAsModal = false;
+            }
+            if (s_openRenameModal) {
+                ig::OpenPopup("Rename Lua Script##lua_rename_modal");
+                s_openRenameModal = false;
+            }
+            if (s_openDeleteModal) {
+                ig::OpenPopup("Delete Lua Script##lua_delete_modal");
+                s_openDeleteModal = false;
+            }
+            if (s_openUnsavedModal) {
+                ig::OpenPopup("Unsaved Changes##lua_unsaved_modal");
+                s_openUnsavedModal = false;
+            }
+
+            if (ig::BeginPopupModal("Save Lua Script As##lua_save_as_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ig::Text("Enter script name (.lua added automatically):");
+                if (s_focusModalInput) {
+                    ig::SetKeyboardFocusHere( );
+                    s_focusModalInput = false;
+                }
+                const bool submit = ig::InputText("##save_as_name", s_modalNameInput, sizeof(s_modalNameInput),
+                                                  ImGuiInputTextFlags_EnterReturnsTrue);
+                if (ig::IsItemEdited( )) {
+                    s_saveAsNeedsOverwriteConfirm = false;
+                    s_modalError.clear( );
+                }
+
+                if (s_saveAsNeedsOverwriteConfirm) {
+                    ig::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "File already exists. Click Overwrite to replace it.");
+                }
+                if (!s_modalError.empty( )) {
+                    ig::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", s_modalError.c_str( ));
+                }
+
+                ig::Spacing( );
+                const char* confirmLabel = s_saveAsNeedsOverwriteConfirm ? "Overwrite" : "Save";
+                if (ig::Button(confirmLabel, ImVec2(100.f, 0.f)) || submit) {
+                    std::string normName;
+                    std::string err;
+                    const bool exists = s_luaScripts.Exists(s_modalNameInput, normName, err);
+                    if (!err.empty( )) {
+                        s_modalError = err;
+                    } else if (exists && !s_saveAsNeedsOverwriteConfirm) {
+                        s_saveAsNeedsOverwriteConfirm = true;
+                    } else {
+                        const std::string content(s_luaBuffer);
+                        if (s_luaScripts.SaveAs(s_modalNameInput, content, s_saveAsNeedsOverwriteConfirm, err)) {
+                            s_luaBaseline = content;
+                            s_luaLastAction = "Saved " + normName;
+                            s_saveAsNeedsOverwriteConfirm = false;
+                            ig::CloseCurrentPopup( );
+                            if (s_pendingContinueSwitchAfterSave) {
+                                s_pendingContinueSwitchAfterSave = false;
+                                ApplyPendingLuaSwitchAction( );
+                            }
+                        } else {
+                            s_modalError = err;
+                        }
+                    }
+                }
+                ig::SameLine( );
+                if (ig::Button("Cancel", ImVec2(100.f, 0.f))) {
+                    s_saveAsNeedsOverwriteConfirm = false;
+                    s_pendingContinueSwitchAfterSave = false;
+                    s_pendingSwitchAction = PendingLuaSwitchAction::None;
+                    s_pendingExampleCode = nullptr;
+                    ig::CloseCurrentPopup( );
+                }
+                ig::EndPopup( );
+            }
+
+            if (ig::BeginPopupModal("Rename Lua Script##lua_rename_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                const auto* active = s_luaScripts.ActiveScript( );
+                ig::Text("Rename '%s' to:", active ? active->fileName.c_str( ) : "");
+                if (s_focusModalInput) {
+                    ig::SetKeyboardFocusHere( );
+                    s_focusModalInput = false;
+                }
+                const bool submit = ig::InputText("##rename_name", s_modalNameInput, sizeof(s_modalNameInput),
+                                                  ImGuiInputTextFlags_EnterReturnsTrue);
+                if (ig::IsItemEdited( )) {
+                    s_modalError.clear( );
+                }
+                if (!s_modalError.empty( )) {
+                    ig::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", s_modalError.c_str( ));
+                }
+
+                ig::Spacing( );
+                if (ig::Button("Rename", ImVec2(100.f, 0.f)) || submit) {
+                    std::string err;
+                    if (s_luaScripts.RenameActive(s_modalNameInput, err)) {
+                        if (const auto* renamed = s_luaScripts.ActiveScript( )) {
+                            s_luaLastAction = "Renamed to " + renamed->fileName;
+                        }
+                        ig::CloseCurrentPopup( );
+                    } else {
+                        s_modalError = err;
+                    }
+                }
+                ig::SameLine( );
+                if (ig::Button("Cancel", ImVec2(100.f, 0.f))) {
+                    ig::CloseCurrentPopup( );
+                }
+                ig::EndPopup( );
+            }
+
+            if (ig::BeginPopupModal("Delete Lua Script##lua_delete_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                const auto* active = s_luaScripts.ActiveScript( );
+                ig::Text("Delete '%s' from disk?", active ? active->fileName.c_str( ) : "");
+                ig::TextDisabled("This action cannot be undone.");
+                ig::Spacing( );
+                if (ig::Button("Delete", ImVec2(100.f, 0.f))) {
+                    const std::string deletedName = active ? active->fileName : "";
+                    std::string err;
+                    if (s_luaScripts.DeleteActive(err)) {
+                        SetLuaEditorText("", true);
+                        s_luaLastAction = "Deleted " + deletedName;
+                    } else {
+                        s_luaLastAction = err;
+                    }
+                    ig::CloseCurrentPopup( );
+                }
+                ig::SameLine( );
+                if (ig::Button("Cancel", ImVec2(100.f, 0.f))) {
+                    ig::CloseCurrentPopup( );
+                }
+                ig::EndPopup( );
+            }
+
+            if (ig::BeginPopupModal("Unsaved Changes##lua_unsaved_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ig::Text("You have unsaved changes in the current Lua script.");
+                ig::Text("Save before switching?");
+                ig::Spacing( );
+                if (ig::Button("Save & Continue", ImVec2(125.f, 0.f))) {
+                    ig::CloseCurrentPopup( );
+                    if (SaveCurrentScriptOrPromptAs(true)) {
+                        ApplyPendingLuaSwitchAction( );
+                    }
+                }
+                ig::SameLine( );
+                if (ig::Button("Discard", ImVec2(90.f, 0.f))) {
+                    ig::CloseCurrentPopup( );
+                    ApplyPendingLuaSwitchAction( );
+                }
+                ig::SameLine( );
+                if (ig::Button("Cancel", ImVec2(90.f, 0.f))) {
+                    s_pendingSwitchAction = PendingLuaSwitchAction::None;
+                    s_pendingExampleCode = nullptr;
+                    ig::CloseCurrentPopup( );
+                }
+                ig::EndPopup( );
+            }
         }
 
         // ──────────────────────────────────────────────────────────────────────
@@ -2127,12 +2395,18 @@ namespace Menu {
         }
 
         static void RenderLuaPanel( ) {
+            if (!s_luaScriptsInitialized) {
+                std::string initErr;
+                s_luaScripts.Initialize(initErr);
+                s_luaScriptsInitialized = true;
+            }
+
             ig::TextDisabled("Type or paste multi-line Lua scripts below.");
             ig::Spacing( );
 
             static float s_logSectionHeight = 160.f;
 
-            const float footerHeight = ig::GetFrameHeightWithSpacing( ) +
+            const float footerHeight = ig::GetFrameHeightWithSpacing( ) * 2.0f +
                                        ig::GetTextLineHeightWithSpacing( ) * 2.0f;
             const float splitterHeight = 12.f;
 
@@ -2140,33 +2414,142 @@ namespace Menu {
 
             if (s_logSectionHeight < 50.f)
                 s_logSectionHeight = 50.f;
-            if (s_logSectionHeight > totalAvail - 100.f)
-                s_logSectionHeight = totalAvail - 100.f;
+            const float maxLogHeight = (totalAvail > 180.f) ? (totalAvail - 140.f) : 50.f;
+            if (s_logSectionHeight > maxLogHeight)
+                s_logSectionHeight = maxLogHeight;
 
-            const float editorHeightAvail = totalAvail - footerHeight - s_logSectionHeight - splitterHeight;
-            const float sidebarWidth = 145.f;
+            const float editorHeightAvail = (std::max)(80.f, totalAvail - footerHeight - s_logSectionHeight - splitterHeight);
+            const float sidebarWidth = 195.f;
 
-            if (ig::BeginChild("##lua_examples", ImVec2(sidebarWidth, editorHeightAvail), true)) {
-                ig::TextDisabled("Examples");
-                ig::Separator( );
-                ig::Spacing( );
-                for (const LuaExample& ex : kLuaExamples) {
-                    if (ig::Button(ex.label, ImVec2(-1.f, 0.f))) {
-                        LoadLuaExample(ex.code);
-                        s_luaLastAction.clear( );
+            if (ig::BeginChild("##lua_sidebar", ImVec2(sidebarWidth, editorHeightAvail), true)) {
+                if (ig::BeginTabBar("##lua_sidebar_tabs")) {
+                    if (ig::BeginTabItem("Saved")) {
+                        const float itemSpacingX = ig::GetStyle( ).ItemSpacing.x;
+                        const float availSidebarW = ig::GetContentRegionAvail( ).x;
+                        const float btnThirdW = (availSidebarW - itemSpacingX * 2.0f) / 3.0f;
+                        const float btnHalfW = (availSidebarW - itemSpacingX) * 0.5f;
+
+                        if (ig::Button("New", ImVec2(btnThirdW, 0.f))) {
+                            RequestLuaSwitch(PendingLuaSwitchAction::NewScript);
+                        }
+                        ig::SameLine( );
+                        if (ig::Button("Save##sidebar", ImVec2(btnThirdW, 0.f))) {
+                            SaveCurrentScriptOrPromptAs(false);
+                        }
+                        ig::SameLine( );
+                        if (ig::Button("Refresh", ImVec2(btnThirdW, 0.f))) {
+                            std::string err;
+                            if (!s_luaScripts.Refresh(err)) {
+                                s_luaLastAction = err;
+                            } else {
+                                s_luaLastAction = "Refreshed script list.";
+                            }
+                        }
+                        if (ig::IsItemHovered( )) {
+                            ig::SetTooltip("Folder: %s", s_luaScripts.DirectoryUtf8( ).c_str( ));
+                        }
+
+                        ig::Separator( );
+
+                        const float actionsFooterH = ig::GetFrameHeightWithSpacing( ) * 2.0f + ig::GetStyle( ).ItemSpacing.y;
+                        const float listH = (std::max)(40.f, ig::GetContentRegionAvail( ).y - actionsFooterH);
+
+                        if (ig::BeginChild("##lua_saved_list", ImVec2(0.f, listH), false)) {
+                            const auto& scripts = s_luaScripts.Scripts( );
+                            const auto activeIdx = s_luaScripts.ActiveIndex( );
+                            if (scripts.empty( )) {
+                                ig::TextDisabled("No saved scripts.");
+                                ig::TextDisabled("Click Save As to store one.");
+                            } else {
+                                const bool dirty = IsLuaEditorDirty( );
+                                for (size_t i = 0; i < scripts.size( ); ++i) {
+                                    const bool isSelected = activeIdx.has_value( ) && (*activeIdx == i);
+                                    std::string label = scripts[i].displayName;
+                                    if (isSelected && dirty)
+                                        label += " *";
+                                    label += "##saved_" + std::to_string(i);
+
+                                    if (ig::Selectable(label.c_str( ), isSelected, ImGuiSelectableFlags_AllowDoubleClick)) {
+                                        if (ig::IsMouseDoubleClicked(0)) {
+                                            std::string code;
+                                            std::string err;
+                                            if (s_luaScripts.ReadScriptByIndex(i, code, err)) {
+                                                ExecuteLuaCode(code.c_str( ));
+                                            } else {
+                                                s_luaLastAction = err;
+                                            }
+                                        } else {
+                                            RequestLuaSwitch(PendingLuaSwitchAction::LoadSavedScript, i);
+                                        }
+                                    }
+                                    if (ig::IsItemHovered( )) {
+                                        ig::SetTooltip("%s\nClick: load into editor\nDouble-click: run directly",
+                                                       scripts[i].fileName.c_str( ));
+                                    }
+                                }
+                            }
+                        }
+                        ig::EndChild( );
+
+                        ig::Separator( );
+                        const bool hasActive = (s_luaScripts.ActiveScript( ) != nullptr);
+                        ig::BeginDisabled(!hasActive);
+                        if (ig::Button("Run", ImVec2(btnHalfW, 0.f))) {
+                            if (const auto activeIdx = s_luaScripts.ActiveIndex( )) {
+                                std::string code;
+                                std::string err;
+                                if (s_luaScripts.ReadScriptByIndex(*activeIdx, code, err)) {
+                                    ExecuteLuaCode(code.c_str( ));
+                                } else {
+                                    s_luaLastAction = err;
+                                }
+                            }
+                        }
+                        ig::SameLine( );
+                        if (ig::Button("Rename", ImVec2(btnHalfW, 0.f))) {
+                            OpenRenameModal( );
+                        }
+                        if (ig::Button("Delete", ImVec2(-1.f, 0.f))) {
+                            s_openDeleteModal = true;
+                        }
+                        ig::EndDisabled( );
+
+                        ig::EndTabItem( );
                     }
-                    if (ig::IsItemHovered( )) {
-                        ig::BeginTooltip( );
-                        ig::PushTextWrapPos(380.f);
-                        ig::TextUnformatted(ex.code);
-                        ig::PopTextWrapPos( );
-                        ig::EndTooltip( );
+
+                    if (ig::BeginTabItem("Examples")) {
+                        for (const LuaExample& ex : kLuaExamples) {
+                            if (ig::Button(ex.label, ImVec2(-1.f, 0.f))) {
+                                RequestLuaSwitch(PendingLuaSwitchAction::LoadExample, 0, ex.code);
+                            }
+                            if (ig::IsItemHovered( )) {
+                                ig::BeginTooltip( );
+                                ig::PushTextWrapPos(380.f);
+                                ig::TextUnformatted(ex.code);
+                                ig::PopTextWrapPos( );
+                                ig::EndTooltip( );
+                            }
+                        }
+                        ig::EndTabItem( );
                     }
+
+                    ig::EndTabBar( );
                 }
             }
             ig::EndChild( );
 
             ig::SameLine( );
+
+            ig::BeginGroup( );
+            const float editorHeaderH = ig::GetFrameHeightWithSpacing( );
+
+            const auto* activeScript = s_luaScripts.ActiveScript( );
+            const bool dirty = IsLuaEditorDirty( );
+            if (activeScript) {
+                ig::Text("Script: %s%s", activeScript->fileName.c_str( ), dirty ? " *" : "");
+            } else {
+                ig::TextDisabled("Script: <unsaved>%s", dirty ? " *" : "");
+            }
 
             const float lineHeight = ig::GetTextLineHeight( );
             const ImVec2 framePad = ig::GetStyle( ).FramePadding;
@@ -2176,7 +2559,7 @@ namespace Menu {
                 if (*p == '\n')
                     ++lineCount;
 
-            const float visibleHeight = editorHeightAvail;
+            const float visibleHeight = (std::max)(40.f, editorHeightAvail - editorHeaderH);
             const float contentHeight = (float)(lineCount + 1) * lineHeight + framePad.y * 2.0f;
             const float editorHeight = (contentHeight > visibleHeight)
                                            ? contentHeight
@@ -2253,12 +2636,13 @@ namespace Menu {
                 }
             }
             ig::EndChild( );
+            ig::EndGroup( );
 
             ig::Spacing( );
             ig::Separator( );
             ig::Spacing( );
 
-            if (ig::Button("Execute", ImVec2(120.f, 0.f))) {
+            if (ig::Button("Execute", ImVec2(95.f, 0.f))) {
                 if (strlen(s_luaBuffer) > 0) {
                     ExecuteLuaCode(s_luaBuffer);
                 } else {
@@ -2268,7 +2652,25 @@ namespace Menu {
 
             ig::SameLine( );
 
-            if (ig::Button("Paste", ImVec2(80.f, 0.f))) {
+            if (ig::Button("Save##toolbar", ImVec2(65.f, 0.f))) {
+                SaveCurrentScriptOrPromptAs(false);
+            }
+
+            ig::SameLine( );
+
+            if (ig::Button("Save As##toolbar", ImVec2(75.f, 0.f))) {
+                OpenSaveAsModal(false);
+            }
+
+            if (!s_luaLastAction.empty( )) {
+                ig::SameLine( );
+                bool isError = (s_luaLastAction.find("Error") != std::string::npos ||
+                                s_luaLastAction.find("Exception") != std::string::npos);
+                ig::TextColored(isError ? ImVec4(1.f, 0.35f, 0.35f, 1.f) : ImVec4(0.55f, 0.85f, 0.55f, 1.f),
+                                "  %s", s_luaLastAction.c_str( ));
+            }
+
+            if (ig::Button("Paste", ImVec2(65.f, 0.f))) {
                 if (InsertClipboardAtCursor(s_luaBuffer, sizeof(s_luaBuffer),
                                             &s_cursorBytePos, &s_lastSelStart, &s_lastSelEnd,
                                             &s_lastBufTextLen)) {
@@ -2279,7 +2681,7 @@ namespace Menu {
 
             ig::SameLine( );
 
-            if (ig::Button("Copy", ImVec2(80.f, 0.f))) {
+            if (ig::Button("Copy", ImVec2(65.f, 0.f))) {
                 int a = s_lastSelStart, b = s_lastSelEnd;
                 if (a > b) {
                     int t = a;
@@ -2297,7 +2699,7 @@ namespace Menu {
 
             ig::SameLine( );
 
-            if (ig::Button("Cut", ImVec2(80.f, 0.f))) {
+            if (ig::Button("Cut", ImVec2(60.f, 0.f))) {
                 int a = s_lastSelStart, b = s_lastSelEnd;
                 if (a > b) {
                     int t = a;
@@ -2322,20 +2724,12 @@ namespace Menu {
 
             ig::SameLine( );
 
-            if (ig::Button("Clear", ImVec2(80.f, 0.f))) {
+            if (ig::Button("Clear", ImVec2(65.f, 0.f))) {
                 memset(s_luaBuffer, 0, sizeof(s_luaBuffer));
                 s_luaLastAction.clear( );
                 s_cursorBytePos = 0;
                 s_lastSelStart = s_lastSelEnd = 0;
                 s_lastBufTextLen = 0;
-            }
-
-            if (!s_luaLastAction.empty( )) {
-                ig::SameLine( );
-                bool isError = (s_luaLastAction.find("Error") != std::string::npos ||
-                                s_luaLastAction.find("Exception") != std::string::npos);
-                ig::TextColored(isError ? ImVec4(1.f, 0.35f, 0.35f, 1.f) : ImVec4(0.55f, 0.85f, 0.55f, 1.f),
-                                "  %s", s_luaLastAction.c_str( ));
             }
 
             ig::Spacing( );
@@ -2419,6 +2813,8 @@ namespace Menu {
                 }
             }
             ig::EndChild( );
+
+            RenderLuaModals( );
         }
 
         // ══════════════════════════════════════════════════════════════════════
@@ -2590,6 +2986,10 @@ namespace Menu {
         io.IniFilename = io.LogFilename = nullptr;
 
         LoadSettings( ); // Auto-load saved menu design at startup
+
+        std::string luaInitErr;
+        s_luaScripts.Initialize(luaInitErr);
+        s_luaScriptsInitialized = true;
     }
 
     void Render( ) {
